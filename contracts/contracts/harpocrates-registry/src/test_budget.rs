@@ -680,3 +680,135 @@ fn budget_receipt_commit_baseline() {
         "commit_receipt_digest",
     );
 }
+
+const MAX_CPU_SET_REVOCATION_ROOT: u64 = 1_500_000;
+const MAX_MEM_SET_REVOCATION_ROOT: u64 = 1_000_000;
+
+const MAX_CPU_CHECK_NON_REVOCATION: u64 = 3_000_000;
+const MAX_MEM_CHECK_NON_REVOCATION: u64 = 2_000_000;
+
+/// Verify that `set_revocation_root` stays within bounded CPU and memory
+/// budgets even after the ring buffer is full and evicting older entries.
+#[test]
+fn budget_set_revocation_root_ring_buffer_stable() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    // Fill the ring buffer (`MAX_REVOCATION_ROOT_HISTORY` = 4) and then rotate
+    // several more times to exercise eviction.
+    for i in 1..=6u8 {
+        env.ledger().set_sequence_number((i as u32) * 10);
+        client.set_revocation_root(&admin, &b32(&env, 0xA0 + i));
+    }
+
+    // Measure the 7th update (when ring buffer is at max capacity)
+    env.ledger().set_sequence_number(70);
+    let (cpu_7th, mem_7th, _) = measure(&env, || {
+        client.set_revocation_root(&admin, &b32(&env, 0xA7))
+    });
+    assert_within(
+        cpu_7th,
+        mem_7th,
+        MAX_CPU_SET_REVOCATION_ROOT,
+        MAX_MEM_SET_REVOCATION_ROOT,
+        "set_revocation_root (full ring buffer)",
+    );
+
+    // Measure the 8th update and verify no budget growth
+    env.ledger().set_sequence_number(80);
+    let (cpu_8th, mem_8th, _) = measure(&env, || {
+        client.set_revocation_root(&admin, &b32(&env, 0xA8))
+    });
+    assert_within(
+        cpu_8th,
+        mem_8th,
+        MAX_CPU_SET_REVOCATION_ROOT,
+        MAX_MEM_SET_REVOCATION_ROOT,
+        "set_revocation_root (8th update)",
+    );
+
+    let cpu_ratio = if cpu_7th == 0 {
+        1.0
+    } else {
+        cpu_8th as f64 / cpu_7th as f64
+    };
+    let mem_ratio = if mem_7th == 0 {
+        1.0
+    } else {
+        mem_8th as f64 / mem_7th as f64
+    };
+    assert!(
+        (0.8..=1.2).contains(&cpu_ratio),
+        "set_revocation_root CPU budget not stable: 7th={cpu_7th}, 8th={cpu_8th}"
+    );
+    assert!(
+        (0.8..=1.2).contains(&mem_ratio),
+        "set_revocation_root memory budget not stable: 7th={mem_7th}, 8th={mem_8th}"
+    );
+}
+
+/// Verify that `check_non_revocation` against the oldest root in a full
+/// ring buffer (worst-case scan) stays within CPU and memory budget limits.
+#[test]
+fn budget_check_non_revocation_historical_root_worst_case() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let verifier_id = env.register(MockBudgetVerifier, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let credential_root = b32(&env, 0x10);
+    let nullifier = b32(&env, 0x20);
+    let domain_separator = BytesN::from_array(&env, &REVOCATION_DOMAIN_SEPARATOR);
+
+    client.init(&admin);
+    client.set_verifier(&admin, &verifier_id);
+    client.add_credential_root(&admin, &credential_root, &b32(&env, 0x30));
+
+    let oldest_root = b32(&env, 0xB1);
+    env.ledger().set_sequence_number(10);
+    client.set_revocation_root(&admin, &oldest_root);
+    env.ledger().set_sequence_number(20);
+    client.set_revocation_root(&admin, &b32(&env, 0xB2));
+    env.ledger().set_sequence_number(30);
+    client.set_revocation_root(&admin, &b32(&env, 0xB3));
+    env.ledger().set_sequence_number(40);
+    client.set_revocation_root(&admin, &b32(&env, 0xB4));
+
+    // Build 128-byte revocation public inputs targeting `oldest_root`
+    let mut bytes = [0u8; 128];
+    let mut rr = [0u8; 32];
+    oldest_root.copy_into_slice(&mut rr);
+    bytes[0..32].copy_from_slice(&rr);
+    let mut nf = [0u8; 32];
+    nullifier.copy_into_slice(&mut nf);
+    bytes[32..64].copy_from_slice(&nf);
+    let mut ds = [0u8; 32];
+    domain_separator.copy_into_slice(&mut ds);
+    bytes[64..96].copy_from_slice(&ds);
+    let mut cr = [0u8; 32];
+    credential_root.copy_into_slice(&mut cr);
+    bytes[96..128].copy_from_slice(&cr);
+    let pi = Bytes::from_array(&env, &bytes);
+    let proof = proof_buf(&env);
+
+    env.ledger().set_sequence_number(50);
+    let (cpu, mem, _) = measure(&env, || client.check_non_revocation(&pi, &proof));
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_CHECK_NON_REVOCATION,
+        MAX_MEM_CHECK_NON_REVOCATION,
+        "check_non_revocation (historical root worst-case)",
+    );
+}

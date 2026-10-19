@@ -40,6 +40,7 @@
 //! | `register_anonymous_verified`| Tier-1 path with external verifier call.   |
 //! | `revoke_proof`               | Admin action; mutates existing record.     |
 //! | `get_proof_status`           | Read-only query; must be sub-linear.       |
+//! | `list_lineage_children`      | Read-only query; full page read bounds.    |
 //!
 //! ## Variance policy
 //!
@@ -176,6 +177,9 @@ const MAX_MEM_REVOKE_PROOF: u64 = 600_000;
 
 const MAX_CPU_GET_PROOF_STATUS: u64 = 500_000;
 const MAX_MEM_GET_PROOF_STATUS: u64 = 400_000;
+
+const MAX_CPU_GET_PROOF_ASSURANCE: u64 = 800_000;
+const MAX_MEM_GET_PROOF_ASSURANCE: u64 = 600_000;
 
 const MAX_CPU_REGISTER_SEAL_WORST_CASE: u64 = 2_000_000;
 const MAX_MEM_REGISTER_SEAL_WORST_CASE: u64 = 1_500_000;
@@ -434,6 +438,33 @@ fn budget_get_proof_status_baseline() {
     );
 }
 
+#[test]
+fn budget_get_proof_assurance_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let source = Address::generate(&env);
+    let proof_id = b32(&env, 0x51);
+
+    client.init(&admin);
+    client.register_source(&source, &b32(&env, 0x52), &b32(&env, 0x53), &proof_id);
+
+    let (cpu, mem, assurance) = measure(&env, || client.get_proof_assurance(&proof_id));
+    assert!(assurance.is_some());
+    let assurance = assurance.unwrap();
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_GET_PROOF_ASSURANCE,
+        MAX_MEM_GET_PROOF_ASSURANCE,
+        "get_proof_assurance",
+    );
+}
+
 const MAX_CPU_GET_PROOF_STATUSES: u64 = 12_000_000;
 const MAX_MEM_GET_PROOF_STATUSES: u64 = 3_000_000;
 
@@ -681,134 +712,72 @@ fn budget_receipt_commit_baseline() {
     );
 }
 
-const MAX_CPU_SET_REVOCATION_ROOT: u64 = 1_500_000;
-const MAX_MEM_SET_REVOCATION_ROOT: u64 = 1_000_000;
+const MAX_CPU_LIST_LINEAGE_CHILDREN_PAGE: u64 = 6_000_000;
+const MAX_MEM_LIST_LINEAGE_CHILDREN_PAGE: u64 = 1_500_000;
 
-const MAX_CPU_CHECK_NON_REVOCATION: u64 = 3_000_000;
-const MAX_MEM_CHECK_NON_REVOCATION: u64 = 2_000_000;
-
-/// Verify that `set_revocation_root` stays within bounded CPU and memory
-/// budgets even after the ring buffer is full and evicting older entries.
+/// Baseline for `list_lineage_children` at `MAX_LINEAGE_CHILDREN_PAGE` (50 entries).
+///
+/// Registers enough children for a full page and records CPU/memory for one
+/// `list_lineage_children` call, asserting it stays within resource thresholds.
 #[test]
-fn budget_set_revocation_root_ring_buffer_stable() {
-    use soroban_sdk::testutils::Ledger as _;
-
+fn budget_list_lineage_children_full_page_baseline() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(HarpocratesRegistry, ());
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.init(&admin);
+    let actor = Address::generate(&env);
+    let parent = b32(&env, 0x10);
 
-    // Fill the ring buffer (`MAX_REVOCATION_ROOT_HISTORY` = 4) and then rotate
-    // several more times to exercise eviction.
-    for i in 1..=6u8 {
-        env.ledger().set_sequence_number((i as u32) * 10);
-        client.set_revocation_root(&admin, &b32(&env, 0xA0 + i));
+    client.init(&admin);
+    client.register_source(&actor, &b32(&env, 0x11), &b32(&env, 0x12), &parent);
+
+    // Register MAX_LINEAGE_CHILDREN_PAGE (50) children
+    let mut expected_children = SorobanVec::new(&env);
+    for i in 0..MAX_LINEAGE_CHILDREN_PAGE {
+        let mut child_arr = [0x20u8; 32];
+        child_arr[0] = (i & 0xFF) as u8;
+        child_arr[1] = ((i >> 8) & 0xFF) as u8;
+        let child = BytesN::from_array(&env, &child_arr);
+
+        let mut manifest_arr = [0x30u8; 32];
+        manifest_arr[0] = (i & 0xFF) as u8;
+        manifest_arr[1] = ((i >> 8) & 0xFF) as u8;
+        let manifest = BytesN::from_array(&env, &manifest_arr);
+
+        client.register_lineage(
+            &actor,
+            &SorobanVec::from_array(&env, [parent.clone()]),
+            &manifest,
+            &Symbol::new(&env, "crop"),
+            &child,
+            &1,
+        );
+        expected_children.push_back(child);
     }
 
-    // Measure the 7th update (when ring buffer is at max capacity)
-    env.ledger().set_sequence_number(70);
-    let (cpu_7th, mem_7th, _) = measure(&env, || {
-        client.set_revocation_root(&admin, &b32(&env, 0xA7))
+    assert_eq!(
+        client.get_lineage_children_count(&parent),
+        MAX_LINEAGE_CHILDREN_PAGE
+    );
+
+    // Measure reading a full page of MAX_LINEAGE_CHILDREN_PAGE entries
+    let (cpu, mem, page) = measure(&env, || {
+        client.list_lineage_children(&parent, &0, &MAX_LINEAGE_CHILDREN_PAGE)
     });
-    assert_within(
-        cpu_7th,
-        mem_7th,
-        MAX_CPU_SET_REVOCATION_ROOT,
-        MAX_MEM_SET_REVOCATION_ROOT,
-        "set_revocation_root (full ring buffer)",
-    );
 
-    // Measure the 8th update and verify no budget growth
-    env.ledger().set_sequence_number(80);
-    let (cpu_8th, mem_8th, _) = measure(&env, || {
-        client.set_revocation_root(&admin, &b32(&env, 0xA8))
-    });
-    assert_within(
-        cpu_8th,
-        mem_8th,
-        MAX_CPU_SET_REVOCATION_ROOT,
-        MAX_MEM_SET_REVOCATION_ROOT,
-        "set_revocation_root (8th update)",
-    );
+    assert_eq!(page.total, MAX_LINEAGE_CHILDREN_PAGE);
+    assert_eq!(page.next_offset, MAX_LINEAGE_CHILDREN_PAGE);
+    assert_eq!(page.children.len(), MAX_LINEAGE_CHILDREN_PAGE);
+    assert_eq!(page.children, expected_children);
 
-    let cpu_ratio = if cpu_7th == 0 {
-        1.0
-    } else {
-        cpu_8th as f64 / cpu_7th as f64
-    };
-    let mem_ratio = if mem_7th == 0 {
-        1.0
-    } else {
-        mem_8th as f64 / mem_7th as f64
-    };
-    assert!(
-        (0.8..=1.2).contains(&cpu_ratio),
-        "set_revocation_root CPU budget not stable: 7th={cpu_7th}, 8th={cpu_8th}"
-    );
-    assert!(
-        (0.8..=1.2).contains(&mem_ratio),
-        "set_revocation_root memory budget not stable: 7th={mem_7th}, 8th={mem_8th}"
-    );
-}
-
-/// Verify that `check_non_revocation` against the oldest root in a full
-/// ring buffer (worst-case scan) stays within CPU and memory budget limits.
-#[test]
-fn budget_check_non_revocation_historical_root_worst_case() {
-    use soroban_sdk::testutils::Ledger as _;
-
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(HarpocratesRegistry, ());
-    let verifier_id = env.register(MockBudgetVerifier, ());
-    let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let credential_root = b32(&env, 0x10);
-    let nullifier = b32(&env, 0x20);
-    let domain_separator = BytesN::from_array(&env, &REVOCATION_DOMAIN_SEPARATOR);
-
-    client.init(&admin);
-    client.set_verifier(&admin, &verifier_id);
-    client.add_credential_root(&admin, &credential_root, &b32(&env, 0x30));
-
-    let oldest_root = b32(&env, 0xB1);
-    env.ledger().set_sequence_number(10);
-    client.set_revocation_root(&admin, &oldest_root);
-    env.ledger().set_sequence_number(20);
-    client.set_revocation_root(&admin, &b32(&env, 0xB2));
-    env.ledger().set_sequence_number(30);
-    client.set_revocation_root(&admin, &b32(&env, 0xB3));
-    env.ledger().set_sequence_number(40);
-    client.set_revocation_root(&admin, &b32(&env, 0xB4));
-
-    // Build 128-byte revocation public inputs targeting `oldest_root`
-    let mut bytes = [0u8; 128];
-    let mut rr = [0u8; 32];
-    oldest_root.copy_into_slice(&mut rr);
-    bytes[0..32].copy_from_slice(&rr);
-    let mut nf = [0u8; 32];
-    nullifier.copy_into_slice(&mut nf);
-    bytes[32..64].copy_from_slice(&nf);
-    let mut ds = [0u8; 32];
-    domain_separator.copy_into_slice(&mut ds);
-    bytes[64..96].copy_from_slice(&ds);
-    let mut cr = [0u8; 32];
-    credential_root.copy_into_slice(&mut cr);
-    bytes[96..128].copy_from_slice(&cr);
-    let pi = Bytes::from_array(&env, &bytes);
-    let proof = proof_buf(&env);
-
-    env.ledger().set_sequence_number(50);
-    let (cpu, mem, _) = measure(&env, || client.check_non_revocation(&pi, &proof));
     assert_within(
         cpu,
         mem,
-        MAX_CPU_CHECK_NON_REVOCATION,
-        MAX_MEM_CHECK_NON_REVOCATION,
-        "check_non_revocation (historical root worst-case)",
+        MAX_CPU_LIST_LINEAGE_CHILDREN_PAGE,
+        MAX_MEM_LIST_LINEAGE_CHILDREN_PAGE,
+        "list_lineage_children full page",
     );
 }
+

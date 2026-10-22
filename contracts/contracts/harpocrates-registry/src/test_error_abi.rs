@@ -379,7 +379,7 @@ fn retryable_codes_require_external_condition_only() {
             retryable.push(row.code);
         }
     }
-    let expected: &[u32] = &[21, 32, 41, 66, 86];
+    let expected: &[u32] = &[21, 32, 41, 66, 86, 88];
     assert_eq!(
         retryable.as_slice(),
         expected,

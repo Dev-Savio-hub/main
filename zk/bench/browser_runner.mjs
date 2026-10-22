@@ -46,22 +46,12 @@ const textEncoder = new TextEncoder()
 const FALLBACK_MAX_SECRET_BYTES = 256
 const FALLBACK_MAX_CONCURRENCY = 1
 const RUNTIME_MODES = ['worker', 'main']
-const SUPPORTED_CIRCUITS = ['silent_witness', 'revocation_witness']
-
 function signal(event, fields = {}) {
   console.error(JSON.stringify({ event, ...fields }))
 }
 
 function parseArgs(argv) {
-  const out = {
-    cold: 1,
-    warm: 2,
-    discard: 1,
-    timeoutMs: 180_000,
-    mode: 'worker',
-    circuit: 'silent_witness',
-    depth: MAX_REVOCATION_WITNESS_DEPTH,
-  }
+  const out = { cold: 1, warm: 2, discard: 1, timeoutMs: 180_000, mode: 'worker', threads: FALLBACK_MAX_CONCURRENCY }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--cold') out.cold = Number(argv[++i])
@@ -69,8 +59,7 @@ function parseArgs(argv) {
     else if (a === '--discard') out.discard = Number(argv[++i])
     else if (a === '--timeout-ms') out.timeoutMs = Number(argv[++i])
     else if (a === '--mode') out.mode = argv[++i]
-    else if (a === '--circuit') out.circuit = argv[++i]
-    else if (a === '--depth') out.depth = Number(argv[++i])
+    else if (a === '--threads') out.threads = Number(argv[++i])
     else if (a === '--help') out.help = true
   }
   return out
@@ -274,7 +263,7 @@ async function measureOnce({
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
-    console.log('browser_runner.mjs [--cold N] [--warm N] [--discard N] [--timeout-ms MS] [--mode worker|main] [--circuit silent_witness|revocation_witness] [--depth N]')
+    console.log('browser_runner.mjs [--cold N] [--warm N] [--discard N] [--timeout-ms MS] [--mode worker|main] [--threads N]')
     process.exit(0)
   }
 
@@ -345,8 +334,7 @@ async function main() {
     target: targetName,
     fixture_id: fixtureId,
     mode: args.mode,
-    circuit: args.circuit,
-    ...(args.circuit === 'revocation_witness' ? { depth: args.depth, leaf_count: 1 << args.depth } : {}),
+    threads: args.threads,
   })
 
   const proveSamples = []
@@ -378,6 +366,7 @@ async function main() {
     signal('bench.sample', {
       target: targetName,
       mode: args.mode,
+      threads: args.threads,
       state: 'ok',
       elapsed_ms: sample.prove_ms,
     })
@@ -411,7 +400,7 @@ async function main() {
       node_version: process.version,
       cpu_count: os.cpus()?.length ?? 0,
       ci: Boolean(process.env.CI || process.env.GITHUB_ACTIONS),
-      threading: { max_concurrency: FALLBACK_MAX_CONCURRENCY },
+      threading: { max_concurrency: args.threads, requested_threads: args.threads },
     },
     phases: [
       {

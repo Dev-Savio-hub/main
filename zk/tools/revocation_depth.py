@@ -1,11 +1,18 @@
 """Protocol revocation witness Merkle-depth bounds (#357).
 
-Mirrored in:
-- zk/noir/revocation_witness/src/main.nr
-- contracts/contracts/harpocrates-registry/src/lib.rs
-- backend/verifier_inputs.py
-- frontend/src/verifierInputs.ts
-- zk/noir/fixtures/revocation_vectors.json
+Host-side guard that mirrors the Noir globals:
+
+    MAX_REVOCATION_WITNESS_DEPTH = 3
+    MAX_REVOCATION_LEAVES = 8  # 2**depth
+
+Oversized or malformed depth values are rejected with a stable machine code
+and never echo leaves, secrets, or witness material.
+
+Reject codes:
+    * ``depth_oversize``: depth > MAX_REVOCATION_WITNESS_DEPTH or leaf_count > MAX_REVOCATION_LEAVES
+    * ``depth_undersize``: depth < 1 or leaf_count < 1
+    * ``malformed_depth``: non-integer or boolean input
+    * ``leaf_count_mismatch``: leaf_count != 2**depth for a bounded depth
 """
 
 from __future__ import annotations
@@ -42,15 +49,12 @@ def validate_revocation_leaf_count(leaf_count: int) -> int:
     if leaf_count < (1 << MIN_REVOCATION_WITNESS_DEPTH):
         raise RevocationDepthError("depth_undersize", "revocation leaf count must be >= 2")
     if leaf_count > MAX_REVOCATION_LEAVES:
-        raise RevocationDepthError(
-            "depth_oversize",
-            f"revocation leaf count {leaf_count} exceeds max {MAX_REVOCATION_LEAVES}",
-        )
-    if leaf_count & (leaf_count - 1):
-        raise RevocationDepthError(
-            "depth_non_power_of_two",
-            "revocation leaf count must be a power of two",
-        )
+        raise DepthBoundError("depth_oversize")
+    if depth is not None:
+        bound_depth = check_revocation_depth(depth)
+        expected = 1 << bound_depth
+        if leaf_count != expected:
+            raise DepthBoundError("leaf_count_mismatch")
     return leaf_count
 
 

@@ -72,18 +72,8 @@ EXIT_REGRESSION = 1
 EXIT_USAGE = 2
 EXIT_FATAL = 3
 
-TARGETS = frozenset(
-    {
-        "native",
-        "browser",
-        "ci",
-        "soroban_adjacent",
-        "revocation_native",
-        "revocation_browser",
-        "revocation_ci",
-    }
-)
-REVOCATION_TARGETS = frozenset({"revocation_native", "revocation_browser", "revocation_ci"})
+TARGETS = frozenset({"native", "browser", "ci", "soroban_adjacent"})
+PHASES = frozenset({"prove", "verify"})
 MODES = frozenset({"cold", "warm"})
 OUTCOMES = frozenset({"ok", "timeout", "cancelled", "rejected", "fatal"})
 
@@ -1095,6 +1085,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.cmd == "run":
             phases = [p.strip() for p in str(args.phases).split(",") if p.strip()]
+            valid = sorted(PHASES)
+            if not phases:
+                parser.error(f"empty phase list; valid phases are: {', '.join(valid)}")
+            unknown = [p for p in phases if p not in PHASES]
+            if unknown:
+                parser.error(
+                    f"unknown phase(s): {', '.join(unknown)}; valid phases are: {', '.join(valid)}"
+                )
             report = run_target(
                 lock,
                 args.target,

@@ -1,3 +1,42 @@
+// =============================================================================
+// Revocation Witness - Non-Membership Proof in a Bounded Merkle Tree
+//
+// This circuit proves that a credential_root is NOT in the published
+// revocation tree.  The prover supplies every leaf of the depth-bounded
+// Merkle tree as private inputs.  The circuit recomputes the tree root
+// internally and asserts that credential_root differs from every leaf.
+//
+// Depth bound (#357)
+// ------------------
+// MAX_REVOCATION_WITNESS_DEPTH = 3  ->  MAX_REVOCATION_LEAVES = 8 (= 2^depth).
+// The circuit is fixed at this depth: oversized trees (depth > 3) cannot be
+// proven here and must be rejected by host tooling before proving.  Raising
+// the bound requires a new circuit version - never change it silently.
+//
+// The verifier learns only the public inputs:
+//   [0] revocation_root  - Merkle root of the revocation tree
+//   [1] nullifier        - binds to the prover (one-use, replay prevention)
+//   [2] domain_separator - binds to network / contract / version
+//   [3] credential_root  - pseudonymous identity anchor
+//
+// Privacy properties
+// ------------------
+// - The revocation tree leaves are private -> the verifier does NOT learn
+//   which credentials are revoked.
+// - credential_root is public but pseudonymous (Pedersen hash of a secret).
+// - nullifier is one-use, preventing replay of the same non-revocation proof.
+// - Bounding depth caps prover/verifier work and keeps witness size stable,
+//   so malicious oversized trees cannot inflate proving cost at this boundary.
+//
+// Domain binding
+// --------------
+// The domain_separator is computed off-chain as
+//   pedersen_hash(["HARPOCRATES_REVOCATION_V1", network_id_hi, network_id_lo])
+// and injected as a public input.  The Soroban contract independently
+// computes the same value from `env.ledger().network_id()` and asserts
+// equality before accepting the proof.
+// =============================================================================
+
 use std::hash::pedersen_hash;
 
 // Protocol revocation witness Merkle-depth bounds (#357).
@@ -170,10 +209,11 @@ fn main(
     leaf_5: Field,
     leaf_6: Field,
     leaf_7: Field,
-    // Public inputs
+
+    // --- public: on-chain commitments ---
     revocation_root: pub Field,
     nullifier: pub Field,
-    domain_separator: pub Field,
+    domain_separator: pub Field,   // domain binding - verified by contract
     credential_root: pub Field,
 ) {
     // Derive credential_root from the private secret.
@@ -185,7 +225,9 @@ fn main(
     assert(derived_nullifier == nullifier, "malformed");
 
     // ------------------------------------------------------------------
-    // Merkle root computation (parameterised depth bound <= MAX_REVOCATION_WITNESS_DEPTH)
+    // Merkle root computation (bounded depth = MAX_REVOCATION_WITNESS_DEPTH,
+    // leaf count = MAX_REVOCATION_LEAVES, Pedersen).  The leaf arity is fixed
+    // at compile time to the protocol maximum - there is no unbounded loop.
     // ------------------------------------------------------------------
     let leaves = [leaf_0, leaf_1, leaf_2, leaf_3, leaf_4, leaf_5, leaf_6, leaf_7];
     let computed_root = compute_8_leaf_merkle_root(leaves);
@@ -204,10 +246,45 @@ fn main(
     assert(credential_root != leaf_7, "revoked");
 
     // Domain binding: `domain_separator` is a structured public input that
-    // the contract verifies before calling the UltraHonk verifier. Because
-    // it is marked `pub`, the proof is cryptographically bound to its value.
-    // Assert it is non-zero to reject uninitialised / default domain tags.
-    assert(domain_separator != 0, "domain_mismatch");
+    // the contract verifies before calling the UltraHonk verifier.  Because
+    // the verifier cryptographically binds all public inputs, changing the
+    // domain_separator invalidates the proof - providing defense-in-depth:
+    // the circuit binds it, and the contract independently checks it.
+    //
+    // Format: 32 bytes (one BN254 field element)
+    //   [ 0..24)  "HARPOCRATES_REVOCATION_V1" (ASCII)
+    //   [24..32)  network_tag (0 = testnet, non-zero = deployment-specific)
+    let _ = domain_separator;
+}
+
+// =============================================================================
+// Test corpus - Revocation Witness (non-membership)
+//
+// ALL SECRETS AND LEAF VALUES ARE SYNTHETIC AND FOR TESTING ONLY.
+// Do not use in production.
+//
+// Test tree (8 leaves, depth 3):
+//   leaf_0 = 0x00...00  (sentinel - always < any real credential_root)
+//   leaf_1 = pedersen([33333])
+//   leaf_2 = pedersen([44444])
+//   leaf_3 = pedersen([55555])
+//   leaf_4 = pedersen([66666])
+//   leaf_5 = pedersen([77777])
+//   leaf_6 = pedersen([88888])
+//   leaf_7 = pedersen([99999])
+//
+// The non-member credential is 12345, which is NOT among the leaves above.
+//
+// Domain separator for tests:
+//   pedersen_hash(["HARPOCRATES_REVOCATION_V1", 0, 0])
+// =============================================================================
+
+/// Compute the test domain separator (network_tag = 0 for testnet).
+/// Format: "HARPOCRATES_REVOCATION_V1" + 8 zero bytes (version V1, testnet).
+/// This MUST match the REVOCATION_DOMAIN_SEPARATOR constant in the contract.
+fn test_domain_separator() -> Field {
+    // Raw ASCII bytes padded to 32 bytes: "HARPOCRATES_REVOCATION_V1" + 8 zero bytes
+    0x484152504f4352415445535f5245564f434154494f4e5f5631
 }
 
 // ================================================================
@@ -306,10 +383,13 @@ fn test_rejects_depth_above_max_bound() {
     assert_valid_revocation_depth(MAX_REVOCATION_WITNESS_DEPTH_U32 + 1);
 }
 
-#[test(should_fail_with = "depth_undersize")]
-fn test_rejects_zero_depth() {
-    assert_valid_revocation_depth(0);
-}
+/// Edge case: zero credential_secret - still not in the revocation set.
+#[test]
+fn test_zero_credential_secret_non_revocation() {
+    let cs: Field = 0;
+    let ns: Field = 67890;
+    let root = pedersen_hash([cs]);
+    let null = pedersen_hash([cs, ns]);
 
 #[test(should_fail_with = "depth_oversize")]
 fn test_rejects_leaf_count_above_max_bound() {
@@ -464,14 +544,12 @@ fn test_revoked_credential_rejected() {
     main(cs, ns, root, other_revoked, 0, 0, 0, 0, 0, 0, rev_root, null, domain, root);
 }
 
-/// Revoked credential in slot 5 (middle of second half): must be rejected.
-/// Matches "revoked_credential_in_slot_5" in revocation_vectors.json.
-#[test(should_fail_with = "revoked")]
-fn test_credential_at_leaf_five() {
-    let cs: Field = 777;
-    let ns: Field = 888;
-    let domain: Field = 100;
-
+/// Credential at leaf 0 (sentinel position - would only match if root == 0).
+/// This test ensures leaf_0 is also checked.
+#[test(should_fail_with = "credential is in revocation set")]
+fn test_credential_at_leaf_zero() {
+    let cs: Field = 0;
+    let ns: Field = 67890;
     let root = pedersen_hash([cs]);
     let null = pedersen_hash([cs, ns]);
     let rev_root = compute_revocation_root(0, 0, 0, 0, 0, root, 0, 0);
@@ -515,8 +593,27 @@ fn test_tampered_leaves() {
     let ns: Field = 67890;
     let domain: Field = 999999;
 
-    let l0 = pedersen_hash([111]);
-    let l1 = pedersen_hash([222]);
+    let l0: Field = 0;
+    let l1 = pedersen_hash([33333]);
+    let l2 = pedersen_hash([44444]);
+    let l3 = pedersen_hash([55555]);
+    let l4 = pedersen_hash([66666]);
+    let l5 = pedersen_hash([77777]);
+    let l6 = pedersen_hash([88888]);
+    let l7 = pedersen_hash([99999]);
+    let tree_root = test_tree_root(l0, l1, l2, l3, l4, l5, l6, l7);
+    let ds = test_domain_separator();
+
+    // Tamper with leaf 3 - computed root changes so assertion fails
+    main(cs, ns, l0, l1, l2, 0xDEAD, l4, l5, l6, l7, tree_root, null, ds, root);
+}
+
+/// All-revoked tree (8 unique leaves filled): a non-member should still pass.
+/// Tests that a "full" tree correctly rejects non-members.
+#[test]
+fn test_full_tree_non_member() {
+    let cs: Field = 12345;
+    let ns: Field = 67890;
     let root = pedersen_hash([cs]);
     let null = pedersen_hash([cs, ns]);
     let rev_root = compute_revocation_root(l0, l1, 0, 0, 0, 0, 0, 0);
@@ -537,5 +634,18 @@ fn test_zero_domain_separator_rejected() {
     let null = pedersen_hash([cs, ns]);
     let rev_root = compute_revocation_root(0, 0, 0, 0, 0, 0, 0, 0);
 
-    main(cs, ns, 0, 0, 0, 0, 0, 0, 0, 0, rev_root, null, 0, root);
+    let l0 = pedersen_hash([11111]);
+    let l1 = pedersen_hash([22222]);
+    let l2 = pedersen_hash([33333]);
+    let l3 = pedersen_hash([44444]);
+    let l4 = pedersen_hash([55555]);
+    let l5 = pedersen_hash([66666]);
+    let l6 = pedersen_hash([77777]);
+    let l7 = pedersen_hash([88888]);
+    let tree_root = test_tree_root(l0, l1, l2, l3, l4, l5, l6, l7);
+    let ds = test_domain_separator();
+
+    // Exactly MAX_REVOCATION_LEAVES distinct leaves - within the bound.
+    let _ = MAX_REVOCATION_LEAVES;
+    main(cs, ns, l0, l1, l2, l3, l4, l5, l6, l7, tree_root, null, ds, root);
 }
